@@ -24,6 +24,22 @@ https://bitcoin-blake.github.io/blaketest/?api=reset
 
 The base must serve the Esplora endpoints the wallet uses: `address/:a`, `address/:a/txs`, `address/:a/utxo`, `v1/fees/recommended`, and `POST tx`. A mempool or electrs instance behind a Knots 29.4.1 testnet4 node does. Explorer links are the base with `/api` stripped.
 
+## Running your own backend
+
+mempool.guide's testnet4 follows a dead release-candidate chain, so a real backend means your own Knots 29.4.1 testnet4 node. `shim/server.mjs` is a small Esplora-shaped HTTP server over a [jasonsopko/electrs](https://github.com/jasonsopko/electrs) (`blake2b` branch) instance plus Knots RPC:
+
+```
+# electrs: clone -b blake2b, then (RocksDB needs cstdint on new toolchains)
+CC=clang CXX=clang++ CXXFLAGS="-include cstdint" cargo build --locked --release
+./target/release/electrs --conf config.toml     # network = "testnet4", daemon_rpc_addr = 127.0.0.1:48342
+
+# shim
+npm install
+node shim/server.mjs --port 3006 --electrum 127.0.0.1:50001 --rpc 127.0.0.1:48342 --cookie ~/.bitcoin/testnet4/.cookie
+```
+
+Then open the wallet with `?api=http://127.0.0.1:3006/api`. Browsers allow an https page to call `http://127.0.0.1`, so the hosted wallet works against a local shim. The shim serves `address/:a`, `address/:a/utxo`, `address/:a/txs`, `tx/:id`, `v1/fees/recommended`, `blocks/tip/height` and `POST tx`, with open CORS and no auth. Testnet only, keep it on localhost or behind a proxy.
+
 ## Files
 
 - `index.html` — the wallet. Preact plus htm, no build step, dependencies from esm.sh via an import map.
@@ -31,6 +47,7 @@ The base must serve the Esplora endpoints the wallet uses: `address/:a`, `addres
 - `unified.js` — the unified sighash message for all four script types, plus a raw transaction parser.
 - `unified-sighash.md`, `unified_sighash.json` — the spec and the 166 test vectors, copied verbatim from the Knots tag.
 - `test.mjs` — runs every vector and a build, sign, verify round trip.
+- `shim/server.mjs` — Esplora-lite over electrs and Knots RPC, see above.
 
 ## Test
 

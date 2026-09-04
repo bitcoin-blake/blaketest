@@ -170,10 +170,11 @@ async function handle(method, path, body) {
 }
 
 http.createServer(async (req, res) => {
-  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Private-Network': 'true', 'Access-Control-Max-Age': '600' };
   if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
   let body = ''; for await (const c of req) body += c;
   const url = new URL(req.url, 'http://x');
+  console.log(new Date().toISOString().slice(11,19), req.method, url.pathname, req.headers.origin || '');
   try {
     const out = await handle(req.method, url.pathname, body);
     if (out && typeof out === 'object' && 'raw' in out && Object.keys(out).length === 1) { res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' }); return res.end(out.raw); }

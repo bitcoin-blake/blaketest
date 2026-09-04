@@ -1,0 +1,14 @@
+{
+  "name": "blaketest",
+  "version": "0.1.0",
+  "description": "Client-side taproot wallet for the Bitcoin BLAKE2b testnet4 chain, signing with the unified opt-in sighash",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "1.4.0",
+    "@noble/hashes": "1.4.0"
+  }
+}

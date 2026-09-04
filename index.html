@@ -1,0 +1,1236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>blaketest — Bitcoin BLAKE2b testnet4 wallet</title>
+  <meta name="description" content="blaketest: a client-side taproot wallet for the Bitcoin BLAKE2b chain on testnet4. Signs with the unified opt-in sighash. Keys never leave your browser." />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="blaketest" />
+  <meta property="og:title" content="blaketest — Bitcoin BLAKE2b testnet4 wallet" />
+  <meta property="og:description" content="A client-side taproot wallet for the Bitcoin BLAKE2b chain on testnet4. Replay-protected spends via the unified sighash. Keys never leave your browser." />
+  <meta property="og:url" content="https://bitcoin-blake.github.io/blaketest/" />
+  <meta property="og:image" content="https://bitcoin-blake.github.io/blaketest/og-card.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="blaketest — Bitcoin BLAKE2b testnet4 wallet" />
+  <meta name="twitter:description" content="A client-side taproot wallet for the Bitcoin BLAKE2b chain on testnet4. Keys never leave your browser." />
+  <meta name="twitter:image" content="https://bitcoin-blake.github.io/blaketest/og-card.png" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔥</text></svg>" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: {
+              50: '#f0f9ff',
+              100: '#e0f2fe',
+              200: '#bae6fd',
+              300: '#7dd3fc',
+              400: '#38bdf8',
+              500: '#0ea5e9',
+              600: '#0284c7',
+              700: '#0369a1',
+              800: '#075985',
+              900: '#0c4a6e',
+              950: '#082f49',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <script type="importmap">
+    {
+      "imports": {
+        "@noble/curves/secp256k1": "https://esm.sh/@noble/curves@1.4.0/secp256k1",
+        "@noble/hashes/sha256": "https://esm.sh/@noble/hashes@1.4.0/sha256"
+      }
+    }
+  </script>
+    <style>
+    .loader {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #0ea5e9;
+      border-radius: 50%;
+      width: 24px;
+      height: 24px;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body class="bg-gray-900 min-h-screen">
+  <div id="app"></div>
+
+  <script type="module">
+    import { h, render, Component } from 'https://esm.sh/preact@10.19.3';
+    import { useState, useEffect, useCallback } from 'https://esm.sh/preact@10.19.3/hooks';
+    import htm from 'https://esm.sh/htm@3.1.1';
+    import QRCode from 'https://esm.sh/qrcode@1.5.3';
+    import {
+      generatePrivateKey, getPublicKey, getXOnlyPubKey, getTaprootAddress,
+      privateKeyToWIF, parsePrivateKey, bytesToHex, hexToBytes, createTransaction
+    } from './bitcoin.js';
+
+    const html = htm.bind(h);
+
+    // ===== API FUNCTIONS =====
+
+    // Esplora-style API on the BLAKE2b testnet4 chain. Override with
+    // ?api=<base> (remembered in localStorage) or ?api=reset to go back to
+    // the default. Explorer links are derived by stripping the trailing /api.
+    const DEFAULT_API_BASE = 'https://mempool.guide/testnet4/api';
+    function resolveApiBase() {
+      const params = new URLSearchParams(window.location.search);
+      const q = params.get('api');
+      try {
+        if (q === 'reset') { localStorage.removeItem('blaketest_api'); }
+        else if (q) { localStorage.setItem('blaketest_api', q.replace(/\/+$/, '')); }
+        const stored = localStorage.getItem('blaketest_api');
+        if (stored) return stored;
+      } catch (e) { /* storage unavailable */ }
+      return DEFAULT_API_BASE;
+    }
+    const API_BASE = resolveApiBase();
+    const API_IS_DEFAULT = API_BASE === DEFAULT_API_BASE;
+    const EXPLORER_BASE = API_BASE.replace(/\/api$/, '');
+    const txLink = (txid) => `${EXPLORER_BASE}/tx/${txid}`;
+
+    async function fetchBalance(address) {
+      try {
+        const response = await fetch(`${API_BASE}/address/${address}`);
+        if (!response.ok) throw new Error('Failed to fetch balance');
+        const data = await response.json();
+        const confirmed = data.chain_stats.funded_txo_sum - data.chain_stats.spent_txo_sum;
+        const unconfirmed = data.mempool_stats.funded_txo_sum - data.mempool_stats.spent_txo_sum;
+        return { confirmed, unconfirmed, total: confirmed + unconfirmed };
+      } catch (error) {
+        console.error('Error fetching balance:', error);
+        return { confirmed: 0, unconfirmed: 0, total: 0 };
+      }
+    }
+
+    async function fetchTransactions(address) {
+      try {
+        const response = await fetch(`${API_BASE}/address/${address}/txs`);
+        if (!response.ok) throw new Error('Failed to fetch transactions');
+        return await response.json();
+      } catch (error) {
+        console.error('Error fetching transactions:', error);
+        return [];
+      }
+    }
+
+    async function fetchUTXOs(address) {
+      try {
+        const response = await fetch(`${API_BASE}/address/${address}/utxo`);
+        if (!response.ok) throw new Error('Failed to fetch UTXOs');
+        return await response.json();
+      } catch (error) {
+        console.error('Error fetching UTXOs:', error);
+        return [];
+      }
+    }
+
+    async function fetchFeeRates() {
+      try {
+        const response = await fetch(`${API_BASE}/v1/fees/recommended`);
+        if (!response.ok) throw new Error('Failed to fetch fee rates');
+        return await response.json();
+      } catch (error) {
+        console.error('Error fetching fee rates:', error);
+        return { fastestFee: 2, halfHourFee: 1, hourFee: 1, minimumFee: 1 };
+      }
+    }
+
+    async function broadcastTransaction(txHex) {
+      try {
+        const response = await fetch(`${API_BASE}/tx`, {
+          method: 'POST',
+          body: txHex
+        });
+        if (!response.ok) {
+          const error = await response.text();
+          throw new Error(error);
+        }
+        return await response.text();
+      } catch (error) {
+        throw error;
+      }
+    }
+
+    // ===== WALLET STORAGE =====
+
+    function saveWallet(wallet) {
+      localStorage.setItem('blaketest_wallet', JSON.stringify(wallet));
+    }
+
+    function loadWallet() {
+      const data = localStorage.getItem('blaketest_wallet');
+      return data ? JSON.parse(data) : null;
+    }
+
+    function clearWallet() {
+      localStorage.removeItem('blaketest_wallet');
+    }
+
+    // ===== REACT COMPONENTS =====
+
+    function App() {
+      const [wallet, setWallet] = useState(null);
+      const [view, setView] = useState('home');
+      const [balance, setBalance] = useState({ confirmed: 0, unconfirmed: 0, total: 0 });
+      const [transactions, setTransactions] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [notification, setNotification] = useState(null);
+      const [showSchemeInfo, setShowSchemeInfo] = useState(false);
+
+      useEffect(() => {
+        const savedWallet = loadWallet();
+        if (savedWallet) {
+          setWallet(savedWallet);
+        }
+        // Import a key passed in the URL fragment: #<hex|nsec|WIF> or
+        // #privkey=<hex|nsec|WIF>. The fragment is never sent to the server;
+        // it is scrubbed from the address bar after a successful import.
+        const applyHashKey = () => {
+          let hash = decodeURIComponent(window.location.hash.slice(1));
+          if (!hash) return;
+          if (hash.startsWith('privkey=')) hash = hash.slice(8);
+          let privateKey;
+          try {
+            privateKey = parsePrivateKey(hash);
+          } catch {
+            return; // not a key — ignore stray fragments
+          }
+          if (importWallet(bytesToHex(privateKey))) {
+            history.replaceState(null, '', window.location.pathname + window.location.search);
+          }
+        };
+        applyHashKey();
+        window.addEventListener('hashchange', applyHashKey);
+        return () => window.removeEventListener('hashchange', applyHashKey);
+      }, []);
+
+      useEffect(() => {
+        if (wallet) {
+          refreshData();
+        }
+      }, [wallet]);
+
+      const closeSchemeInfo = () => setShowSchemeInfo(false);
+
+      const showNotification = (message, type = 'info') => {
+        setNotification({ message, type });
+        setTimeout(() => setNotification(null), 5000);
+      };
+
+      const refreshData = async () => {
+        if (!wallet) return;
+        setLoading(true);
+        try {
+          const [bal, txs] = await Promise.all([
+            fetchBalance(wallet.address),
+            fetchTransactions(wallet.address)
+          ]);
+          setBalance(bal);
+          setTransactions(txs);
+        } catch (error) {
+          showNotification('Error refreshing data', 'error');
+        }
+        setLoading(false);
+      };
+
+      const createNewWallet = () => {
+        const privateKey = generatePrivateKey();
+        const publicKey = getPublicKey(privateKey);
+        const xOnlyPubKey = getXOnlyPubKey(privateKey);
+        const address = getTaprootAddress(privateKey);
+        const wif = privateKeyToWIF(privateKey);
+
+        const newWallet = {
+          privateKey: bytesToHex(privateKey),
+          publicKey: bytesToHex(publicKey),
+          xOnlyPubKey: bytesToHex(xOnlyPubKey),
+          address,
+          wif
+        };
+
+        setWallet(newWallet);
+        saveWallet(newWallet);
+        showNotification('New Taproot wallet created!', 'success');
+        setView('home');
+      };
+
+      const importWallet = (input) => {
+        try {
+          const privateKey = parsePrivateKey(input);
+          const publicKey = getPublicKey(privateKey);
+          const xOnlyPubKey = getXOnlyPubKey(privateKey);
+          const address = getTaprootAddress(privateKey);
+          const wif = privateKeyToWIF(privateKey);
+
+          const newWallet = {
+            privateKey: bytesToHex(privateKey),
+            publicKey: bytesToHex(publicKey),
+            xOnlyPubKey: bytesToHex(xOnlyPubKey),
+            address,
+            wif
+          };
+
+          setWallet(newWallet);
+          saveWallet(newWallet);
+          showNotification('Wallet imported successfully!', 'success');
+          setView('home');
+          return true;
+        } catch (error) {
+          showNotification('Invalid private key (use 64-char hex, nsec, or WIF)', 'error');
+          return false;
+        }
+      };
+
+      const logout = () => {
+        clearWallet();
+        setWallet(null);
+        setBalance({ confirmed: 0, unconfirmed: 0, total: 0 });
+        setTransactions([]);
+        setView('home');
+        showNotification('Wallet disconnected', 'info');
+      };
+
+      const formatSats = (sats) => {
+        return (sats / 100000000).toFixed(8);
+      };
+
+      const formatDate = (timestamp) => {
+        if (!timestamp) return 'Pending';
+        return new Date(timestamp * 1000).toLocaleString();
+      };
+
+      const truncateHash = (hash, chars = 8) => {
+        return `${hash.slice(0, chars)}...${hash.slice(-chars)}`;
+      };
+
+      return html`
+        <div class="min-h-screen bg-gradient-to-b from-gray-900 to-gray-800">
+          ${notification && html`
+            <div class="fixed top-4 right-4 z-50 px-6 py-3 rounded-lg shadow-lg ${
+              notification.type === 'success' ? 'bg-primary-600' :
+              notification.type === 'error' ? 'bg-red-600' : 'bg-gray-700'
+            } text-white font-medium animate-pulse">
+              ${notification.message}
+            </div>
+          `}
+
+          ${showSchemeInfo && html`
+            <${AddressSchemeModal} onClose=${closeSchemeInfo} />
+          `}
+
+          <${Header} wallet=${wallet} onLogout=${logout} onRefresh=${refreshData} loading=${loading} />
+
+          <main class="container mx-auto px-4 py-8 max-w-4xl">
+            ${!wallet ? html`
+              <${WelcomeScreen} onCreateWallet=${createNewWallet} onImportWallet=${importWallet} />
+            ` : html`
+              <${Navigation} view=${view} setView=${setView} />
+
+              ${view === 'home' && html`
+                <${Dashboard}
+                  wallet=${wallet}
+                  balance=${balance}
+                  transactions=${transactions}
+                  formatSats=${formatSats}
+                  formatDate=${formatDate}
+                  truncateHash=${truncateHash}
+                  onRefresh=${refreshData}
+                  loading=${loading}
+                  onShowInfo=${() => setShowSchemeInfo(true)}
+                />
+              `}
+
+              ${view === 'send' && html`
+                <${SendView}
+                  wallet=${wallet}
+                  balance=${balance}
+                  formatSats=${formatSats}
+                  showNotification=${showNotification}
+                  onRefresh=${refreshData}
+                />
+              `}
+
+              ${view === 'receive' && html`
+                <${ReceiveView} wallet=${wallet} onShowInfo=${() => setShowSchemeInfo(true)} />
+              `}
+
+              ${view === 'history' && html`
+                <${HistoryView}
+                  wallet=${wallet}
+                  transactions=${transactions}
+                  formatSats=${formatSats}
+                  formatDate=${formatDate}
+                  truncateHash=${truncateHash}
+                />
+              `}
+
+              ${view === 'settings' && html`
+                <${SettingsView} wallet=${wallet} onLogout=${logout} />
+              `}
+            `}
+          </main>
+
+          <${Footer} />
+        </div>
+      `;
+    }
+
+    function AddressSchemeModal({ onClose }) {
+      return html`
+        <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70" onClick=${onClose}>
+          <div class="bg-gray-800 border border-gray-700 rounded-2xl p-6 max-w-md w-full shadow-2xl" onClick=${(e) => e.stopPropagation()}>
+            <div class="flex items-center gap-3 mb-4">
+              <div class="w-10 h-10 bg-primary-600 rounded-full flex items-center justify-center flex-shrink-0">
+                <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <h3 class="text-xl font-semibold text-white">How your address works</h3>
+            </div>
+
+            <div class="space-y-3 text-sm text-gray-300">
+              <p>
+                Your Taproot address is the${' '}<strong class="text-white">bech32m encoding of your x-only public key</strong>${' '}—
+                the exact same key as your Nostr${' '}<code class="text-primary-400">npub</code>.
+                One keypair, one identity, on both networks: the data part of
+                your${' '}<code class="text-primary-400">npub</code>${' '}and
+                your${' '}<code class="text-primary-400">tb1p…</code>${' '}address are identical.
+              </p>
+              <p>
+                This means the wallet skips the BIP341 key tweak that most Bitcoin wallets apply.
+                The address is fully valid and spendable on-chain, but if you import the same
+                private key into a standard wallet (e.g. Bitcoin Core), it will derive
+                a${' '}<em>different</em>${' '}(tweaked) address.
+              </p>
+              <div class="bg-yellow-900/30 border border-yellow-700/50 rounded-lg p-3">
+                <p class="text-yellow-400 text-xs">
+                  <strong>Upgrading?</strong> Earlier versions of this wallet used tweaked addresses,
+                  so your address has changed. Coins sent to the old address are not shown here.
+                </p>
+              </div>
+            </div>
+
+            <button
+              onClick=${onClose}
+              class="mt-6 w-full py-3 bg-primary-600 hover:bg-primary-700 text-white font-semibold rounded-lg transition-colors"
+            >
+              Got it
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    function Header({ wallet, onLogout, onRefresh, loading }) {
+      return html`
+        <header class="bg-gray-800/50 backdrop-blur-sm border-b border-gray-700 sticky top-0 z-40">
+          <div class="container mx-auto px-4 py-4 max-w-4xl">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-3">
+                <div class="w-10 h-10 bg-primary-600 rounded-full flex items-center justify-center">
+                  <svg class="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+                  </svg>
+                </div>
+                <div>
+                  <h1 class="text-xl font-bold text-white">blaketest</h1>
+                  <p class="text-xs text-primary-400">Bitcoin BLAKE2b · testnet4${API_IS_DEFAULT ? '' : ' · custom API'}</p>
+                </div>
+              </div>
+              ${wallet && html`
+                <div class="flex items-center gap-2">
+                  <button
+                    onClick=${onRefresh}
+                    disabled=${loading}
+                    class="p-2 text-gray-400 hover:text-primary-400 transition-colors disabled:opacity-50"
+                    title="Refresh"
+                  >
+                    ${loading ? html`<div class="loader"></div>` : html`
+                      <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                    `}
+                  </button>
+                </div>
+              `}
+            </div>
+          </div>
+        </header>
+      `;
+    }
+
+    function Navigation({ view, setView }) {
+      const tabs = [
+        { id: 'home', label: 'Home', icon: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6' },
+        { id: 'send', label: 'Send', icon: 'M12 19l9 2-9-18-9 18 9-2zm0 0v-8' },
+        { id: 'receive', label: 'Receive', icon: 'M12 4v16m8-8H4' },
+        { id: 'history', label: 'History', icon: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' },
+        { id: 'settings', label: 'Settings', icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z' }
+      ];
+
+      return html`
+        <nav class="flex justify-center mb-8">
+          <div class="bg-gray-800 rounded-xl p-1 flex gap-1">
+            ${tabs.map(tab => html`
+              <button
+                key=${tab.id}
+                onClick=${() => setView(tab.id)}
+                class="flex items-center gap-2 px-4 py-2 rounded-lg transition-all ${
+                  view === tab.id
+                    ? 'bg-primary-600 text-white'
+                    : 'text-gray-400 hover:text-white hover:bg-gray-700'
+                }"
+              >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d=${tab.icon} />
+                </svg>
+                <span class="hidden sm:inline">${tab.label}</span>
+              </button>
+            `)}
+          </div>
+        </nav>
+      `;
+    }
+
+    function WelcomeScreen({ onCreateWallet, onImportWallet }) {
+      const [showImport, setShowImport] = useState(false);
+      const [wifInput, setWifInput] = useState('');
+
+      return html`
+        <div class="flex flex-col items-center justify-center min-h-[60vh]">
+          <div class="text-center mb-12">
+            <div class="w-24 h-24 bg-primary-600 rounded-full flex items-center justify-center mx-auto mb-6">
+              <svg class="w-14 h-14 text-white" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>
+              </svg>
+            </div>
+            <h2 class="text-3xl font-bold text-white mb-3">blaketest</h2>
+            <p class="text-gray-400 max-w-md">
+              A client-side taproot wallet for the Bitcoin BLAKE2b chain on testnet4. Spends sign with
+              the unified opt-in sighash, so they cannot be replayed onto the SHA256d chain. Your keys
+              never leave your browser, and one keypair works for both Bitcoin and Nostr.
+            </p>
+          </div>
+
+          ${!showImport ? html`
+            <div class="flex flex-col sm:flex-row gap-4">
+              <button
+                onClick=${onCreateWallet}
+                class="px-8 py-4 bg-primary-600 hover:bg-primary-700 text-white font-semibold rounded-xl transition-colors flex items-center gap-3"
+              >
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                </svg>
+                Create New Wallet
+              </button>
+              <button
+                onClick=${() => setShowImport(true)}
+                class="px-8 py-4 bg-gray-700 hover:bg-gray-600 text-white font-semibold rounded-xl transition-colors flex items-center gap-3"
+              >
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+                Import Wallet
+              </button>
+            </div>
+          ` : html`
+            <div class="w-full max-w-md bg-gray-800 rounded-xl p-6">
+              <h3 class="text-lg font-semibold text-white mb-4">Import Wallet</h3>
+              <div class="space-y-4">
+                <div>
+                  <label class="block text-sm text-gray-400 mb-2">Private Key (Hex or WIF)</label>
+                  <input
+                    type="password"
+                    value=${wifInput}
+                    onInput=${(e) => setWifInput(e.target.value)}
+                    placeholder="64-char hex, nsec1..., or WIF..."
+                    class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary-500"
+                  />
+                  <p class="text-gray-500 text-xs mt-1">Supports 64-char hex, Nostr nsec, or WIF format</p>
+                </div>
+                <div class="flex gap-3">
+                  <button
+                    onClick=${() => onImportWallet(wifInput)}
+                    disabled=${!wifInput}
+                    class="flex-1 py-3 bg-primary-600 hover:bg-primary-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition-colors"
+                  >
+                    Import
+                  </button>
+                  <button
+                    onClick=${() => { setShowImport(false); setWifInput(''); }}
+                    class="px-6 py-3 bg-gray-700 hover:bg-gray-600 text-white font-semibold rounded-lg transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </div>
+          `}
+
+          <div class="mt-12 p-4 bg-yellow-900/30 border border-yellow-700/50 rounded-lg max-w-md">
+            <p class="text-yellow-400 text-sm text-center">
+              <strong>Testnet4 only.</strong> This wallet talks to the BLAKE2b chain's testnet4 (fork height 150,308). Coins have no value. Never paste a mainnet key here.
+            </p>
+          </div>
+        </div>
+      `;
+    }
+
+    function Dashboard({ wallet, balance, transactions, formatSats, formatDate, truncateHash, onRefresh, loading, onShowInfo }) {
+      return html`
+        <div class="space-y-6">
+          <!-- Balance Card -->
+          <div class="bg-gradient-to-br from-primary-900 to-primary-800 rounded-2xl p-6 shadow-xl">
+            <div class="text-center">
+              <p class="text-primary-200 text-sm mb-1">Total Balance</p>
+              <h2 class="text-4xl font-bold text-white mb-2">${formatSats(balance.total)} BTC</h2>
+              <p class="text-primary-300 text-sm">${balance.total.toLocaleString()} sats</p>
+            </div>
+            <div class="grid grid-cols-2 gap-4 mt-6 pt-6 border-t border-primary-700">
+              <div class="text-center">
+                <p class="text-primary-300 text-xs">Confirmed</p>
+                <p class="text-white font-medium">${formatSats(balance.confirmed)} BTC</p>
+              </div>
+              <div class="text-center">
+                <p class="text-primary-300 text-xs">Pending</p>
+                <p class="text-white font-medium">${formatSats(balance.unconfirmed)} BTC</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Address Card -->
+          <div class="bg-gray-800 rounded-xl p-4">
+            <div class="flex items-center justify-between mb-2">
+              <p class="text-gray-400 text-xs">Your Taproot Address</p>
+              <button
+                onClick=${onShowInfo}
+                class="text-gray-500 hover:text-primary-400 transition-colors"
+                title="How is this address derived?"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </button>
+            </div>
+            <div class="flex items-center gap-2">
+              <code class="flex-1 text-primary-400 text-sm bg-gray-900 px-3 py-2 rounded-lg overflow-hidden text-ellipsis">
+                ${wallet.address}
+              </code>
+              <button
+                onClick=${() => { navigator.clipboard.writeText(wallet.address); }}
+                class="p-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
+                title="Copy address"
+              >
+                <svg class="w-5 h-5 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- Recent Transactions -->
+          <div class="bg-gray-800 rounded-xl p-6">
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="text-lg font-semibold text-white">Recent Activity</h3>
+              ${loading && html`<div class="loader"></div>`}
+            </div>
+            ${transactions.length === 0 ? html`
+              <div class="text-center py-8">
+                <svg class="w-12 h-12 text-gray-600 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                </svg>
+                <p class="text-gray-500">No transactions yet</p>
+                <p class="text-gray-600 text-sm mt-1">Mine some on a Knots testnet4 node, or ask in the Knots Discord</p>
+              </div>
+            ` : html`
+              <div class="space-y-3">
+                ${transactions.slice(0, 5).map(tx => {
+                  const isIncoming = tx.vout.some(v => v.scriptpubkey_address === wallet.address);
+                  const isOutgoing = tx.vin.some(v => v.prevout?.scriptpubkey_address === wallet.address);
+                  const type = isOutgoing ? 'sent' : 'received';
+
+                  let amount = 0;
+                  if (type === 'received') {
+                    amount = tx.vout.filter(v => v.scriptpubkey_address === wallet.address).reduce((sum, v) => sum + v.value, 0);
+                  } else {
+                    const inputAmount = tx.vin.filter(v => v.prevout?.scriptpubkey_address === wallet.address).reduce((sum, v) => sum + v.prevout.value, 0);
+                    const changeAmount = tx.vout.filter(v => v.scriptpubkey_address === wallet.address).reduce((sum, v) => sum + v.value, 0);
+                    amount = inputAmount - changeAmount;
+                  }
+
+                  return html`
+                    <div class="flex items-center justify-between p-3 bg-gray-900 rounded-lg">
+                      <div class="flex items-center gap-3">
+                        <div class="w-10 h-10 rounded-full flex items-center justify-center ${type === 'received' ? 'bg-primary-900' : 'bg-red-900'}">
+                          <svg class="w-5 h-5 ${type === 'received' ? 'text-primary-400' : 'text-red-400'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d=${type === 'received' ? 'M19 14l-7 7m0 0l-7-7m7 7V3' : 'M5 10l7-7m0 0l7 7m-7-7v18'} />
+                          </svg>
+                        </div>
+                        <div>
+                          <p class="text-white font-medium capitalize">${type}</p>
+                          <p class="text-gray-500 text-xs">${formatDate(tx.status.block_time)}</p>
+                        </div>
+                      </div>
+                      <div class="text-right">
+                        <p class="font-medium ${type === 'received' ? 'text-primary-400' : 'text-red-400'}">
+                          ${type === 'received' ? '+' : '-'}${formatSats(amount)} BTC
+                        </p>
+                        <a
+                          href="${txLink(tx.txid)}"
+                          target="_blank"
+                          class="text-gray-500 text-xs hover:text-primary-400"
+                        >
+                          ${truncateHash(tx.txid, 6)}
+                        </a>
+                      </div>
+                    </div>
+                  `;
+                })}
+              </div>
+            `}
+          </div>
+
+          <!-- Faucet Info -->
+          <div class="bg-gray-800 rounded-xl p-6">
+            <h3 class="text-lg font-semibold text-white mb-3">Get Test Coins</h3>
+            <p class="text-gray-400 text-sm mb-4">
+              There is no public faucet for the BLAKE2b testnet4 yet. Coins that existed on Bitcoin testnet4
+              before block 150,308 also exist here under the same keys, and a Knots 29.4.1 testnet4 node with a
+              DATUM gateway can mine new ones with a CPU miner.
+            </p>
+            <a
+              href="https://github.com/bitcoin-blake/awesome-bitcoin-blake#mining"
+              target="_blank"
+              class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition-colors"
+            >
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+              </svg>
+              Mining on the BLAKE2b chain
+            </a>
+          </div>
+        </div>
+      `;
+    }
+
+    function SendView({ wallet, balance, formatSats, showNotification, onRefresh }) {
+      const [recipient, setRecipient] = useState('');
+      const [amount, setAmount] = useState('');
+      const [feeRate, setFeeRate] = useState(5);
+      const [feeRates, setFeeRates] = useState(null);
+      const [sending, setSending] = useState(false);
+      const [txResult, setTxResult] = useState(null);
+
+      useEffect(() => {
+        fetchFeeRates().then(setFeeRates);
+      }, []);
+
+      const handleSend = async () => {
+        if (!recipient || !amount) {
+          showNotification('Please fill in all fields', 'error');
+          return;
+        }
+
+        const satsAmount = Math.floor(parseFloat(amount) * 100000000);
+        if (satsAmount <= 0 || satsAmount > balance.total) {
+          showNotification('Invalid amount', 'error');
+          return;
+        }
+
+        setSending(true);
+        try {
+          const utxos = await fetchUTXOs(wallet.address);
+          if (utxos.length === 0) {
+            throw new Error('No UTXOs available');
+          }
+
+          const privateKey = hexToBytes(wallet.privateKey);
+          const tx = await createTransaction(privateKey, utxos, recipient, satsAmount, feeRate);
+
+          const txid = await broadcastTransaction(tx.hex);
+          setTxResult({ txid, amount: satsAmount, fee: tx.fee, replayProtected: tx.replayProtected });
+          showNotification('Transaction sent successfully!', 'success');
+          setRecipient('');
+          setAmount('');
+          onRefresh();
+        } catch (error) {
+          console.error('Send error:', error);
+          showNotification(`Error: ${error.message}`, 'error');
+        }
+        setSending(false);
+      };
+
+      const setMaxAmount = () => {
+        // Leave some for fee
+        const maxSats = balance.total - (feeRate * 200);
+        if (maxSats > 0) {
+          setAmount((maxSats / 100000000).toFixed(8));
+        }
+      };
+
+      return html`
+        <div class="max-w-lg mx-auto">
+          <div class="bg-gray-800 rounded-xl p-6">
+            <h3 class="text-xl font-semibold text-white mb-6">Send Bitcoin</h3>
+
+            ${txResult ? html`
+              <div class="bg-primary-900/50 border border-primary-700 rounded-lg p-6 text-center">
+                <svg class="w-16 h-16 text-primary-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <h4 class="text-lg font-semibold text-white mb-2">Transaction Sent!</h4>
+                <p class="text-gray-400 mb-4">${formatSats(txResult.amount)} BTC sent</p>
+                <p class="text-gray-500 text-sm mb-1">Fee: ${txResult.fee} sats</p>
+                <p class="text-primary-300 text-xs mb-4">Signed with SIGHASH_ALL|UNIFIED (0x21) · replay protected</p>
+                <a
+                  href="${txLink(txResult.txid)}"
+                  target="_blank"
+                  class="text-primary-400 hover:text-primary-300 text-sm break-all"
+                >
+                  ${txResult.txid}
+                </a>
+                <button
+                  onClick=${() => setTxResult(null)}
+                  class="mt-6 w-full py-3 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
+                >
+                  Send Another
+                </button>
+              </div>
+            ` : html`
+              <div class="space-y-5">
+                <div>
+                  <label class="block text-sm text-gray-400 mb-2">Recipient Address</label>
+                  <input
+                    type="text"
+                    value=${recipient}
+                    onInput=${(e) => setRecipient(e.target.value)}
+                    placeholder="tb1p... or tb1q..."
+                    class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary-500"
+                  />
+                </div>
+
+                <div>
+                  <label class="block text-sm text-gray-400 mb-2">Amount (BTC)</label>
+                  <div class="relative">
+                    <input
+                      type="number"
+                      step="0.00000001"
+                      value=${amount}
+                      onInput=${(e) => setAmount(e.target.value)}
+                      placeholder="0.00000000"
+                      class="w-full px-4 py-3 bg-gray-900 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary-500 pr-20"
+                    />
+                    <button
+                      onClick=${setMaxAmount}
+                      class="absolute right-2 top-1/2 -translate-y-1/2 px-3 py-1 bg-primary-600 hover:bg-primary-700 text-white text-sm rounded transition-colors"
+                    >
+                      MAX
+                    </button>
+                  </div>
+                  <p class="text-gray-500 text-xs mt-1">
+                    Available: ${formatSats(balance.total)} BTC
+                  </p>
+                </div>
+
+                <div>
+                  <label class="block text-sm text-gray-400 mb-2">Fee Rate (sat/vB)</label>
+                  <div class="grid grid-cols-3 gap-2 mb-2">
+                    ${feeRates && html`
+                      <button
+                        onClick=${() => setFeeRate(feeRates.hourFee)}
+                        class="py-2 px-3 rounded-lg text-sm ${feeRate === feeRates.hourFee ? 'bg-primary-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}"
+                      >
+                        Slow (${feeRates.hourFee})
+                      </button>
+                      <button
+                        onClick=${() => setFeeRate(feeRates.halfHourFee)}
+                        class="py-2 px-3 rounded-lg text-sm ${feeRate === feeRates.halfHourFee ? 'bg-primary-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}"
+                      >
+                        Normal (${feeRates.halfHourFee})
+                      </button>
+                      <button
+                        onClick=${() => setFeeRate(feeRates.fastestFee)}
+                        class="py-2 px-3 rounded-lg text-sm ${feeRate === feeRates.fastestFee ? 'bg-primary-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}"
+                      >
+                        Fast (${feeRates.fastestFee})
+                      </button>
+                    `}
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="50"
+                    value=${feeRate}
+                    onInput=${(e) => setFeeRate(parseInt(e.target.value))}
+                    class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-primary-500"
+                  />
+                  <p class="text-gray-500 text-xs mt-1">Current: ${feeRate} sat/vB</p>
+                </div>
+
+                <button
+                  onClick=${handleSend}
+                  disabled=${sending || !recipient || !amount}
+                  class="w-full py-4 bg-primary-600 hover:bg-primary-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold rounded-xl transition-colors flex items-center justify-center gap-2"
+                >
+                  ${sending ? html`
+                    <div class="loader"></div>
+                    <span>Sending...</span>
+                  ` : html`
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                    </svg>
+                    <span>Send Bitcoin</span>
+                  `}
+                </button>
+              </div>
+            `}
+          </div>
+        </div>
+      `;
+    }
+
+    function ReceiveView({ wallet, onShowInfo }) {
+      const [copied, setCopied] = useState(false);
+      const qrCanvasRef = useCallback((node) => {
+        if (node && wallet?.address) {
+          QRCode.toCanvas(node, wallet.address, {
+            width: 200,
+            margin: 2,
+            color: {
+              dark: '#38bdf8',
+              light: '#1f2937'
+            }
+          });
+        }
+      }, [wallet?.address]);
+
+      const copyAddress = () => {
+        navigator.clipboard.writeText(wallet.address);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      };
+
+      return html`
+        <div class="max-w-lg mx-auto">
+          <div class="bg-gray-800 rounded-xl p-6 text-center">
+            <h3 class="text-xl font-semibold text-white mb-6">Receive Bitcoin</h3>
+
+            <div class="bg-gray-900 rounded-xl p-6 inline-block mb-6">
+              <canvas ref=${qrCanvasRef}></canvas>
+            </div>
+
+            <div class="bg-gray-900 rounded-lg p-4 mb-4">
+              <p class="text-gray-400 text-xs mb-2">Your Taproot Address (tb1p...)</p>
+              <code class="text-primary-400 text-sm break-all">${wallet.address}</code>
+            </div>
+
+            <button
+              onClick=${copyAddress}
+              class="w-full py-3 bg-primary-600 hover:bg-primary-700 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+            >
+              ${copied ? html`
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                </svg>
+                <span>Copied!</span>
+              ` : html`
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                <span>Copy Address</span>
+              `}
+            </button>
+
+            <p class="text-gray-500 text-sm mt-4">
+              Share this Taproot address to receive Testnet4 Bitcoin
+            </p>
+            <button
+              onClick=${onShowInfo}
+              class="text-primary-400 hover:text-primary-300 text-sm mt-2"
+            >
+              How is this address derived?
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    function HistoryView({ wallet, transactions, formatSats, formatDate, truncateHash }) {
+      return html`
+        <div class="bg-gray-800 rounded-xl p-6">
+          <h3 class="text-xl font-semibold text-white mb-6">Transaction History</h3>
+
+          ${transactions.length === 0 ? html`
+            <div class="text-center py-12">
+              <svg class="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+              </svg>
+              <p class="text-gray-400 text-lg">No transactions yet</p>
+              <p class="text-gray-500 text-sm mt-2">Your transaction history will appear here</p>
+            </div>
+          ` : html`
+            <div class="space-y-4">
+              ${transactions.map(tx => {
+                const isOutgoing = tx.vin.some(v => v.prevout?.scriptpubkey_address === wallet.address);
+                const type = isOutgoing ? 'sent' : 'received';
+
+                let amount = 0;
+                if (type === 'received') {
+                  amount = tx.vout.filter(v => v.scriptpubkey_address === wallet.address).reduce((sum, v) => sum + v.value, 0);
+                } else {
+                  const inputAmount = tx.vin.filter(v => v.prevout?.scriptpubkey_address === wallet.address).reduce((sum, v) => sum + v.prevout.value, 0);
+                  const changeAmount = tx.vout.filter(v => v.scriptpubkey_address === wallet.address).reduce((sum, v) => sum + v.value, 0);
+                  amount = inputAmount - changeAmount;
+                }
+
+                return html`
+                  <div class="bg-gray-900 rounded-lg p-4">
+                    <div class="flex items-center justify-between mb-3">
+                      <div class="flex items-center gap-3">
+                        <div class="w-10 h-10 rounded-full flex items-center justify-center ${type === 'received' ? 'bg-primary-900' : 'bg-red-900'}">
+                          <svg class="w-5 h-5 ${type === 'received' ? 'text-primary-400' : 'text-red-400'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d=${type === 'received' ? 'M19 14l-7 7m0 0l-7-7m7 7V3' : 'M5 10l7-7m0 0l7 7m-7-7v18'} />
+                          </svg>
+                        </div>
+                        <div>
+                          <p class="text-white font-medium capitalize">${type}</p>
+                          <p class="text-gray-500 text-sm">${formatDate(tx.status.block_time)}</p>
+                        </div>
+                      </div>
+                      <div class="text-right">
+                        <p class="text-lg font-semibold ${type === 'received' ? 'text-primary-400' : 'text-red-400'}">
+                          ${type === 'received' ? '+' : '-'}${formatSats(amount)} BTC
+                        </p>
+                        <p class="text-gray-500 text-sm">
+                          ${tx.status.confirmed ? html`
+                            <span class="text-primary-400">Confirmed</span>
+                          ` : html`
+                            <span class="text-yellow-400">Pending</span>
+                          `}
+                        </p>
+                      </div>
+                    </div>
+                    <div class="pt-3 border-t border-gray-800">
+                      <div class="flex items-center justify-between">
+                        <span class="text-gray-500 text-sm">Transaction ID</span>
+                        <a
+                          href="${txLink(tx.txid)}"
+                          target="_blank"
+                          class="text-primary-400 hover:text-primary-300 text-sm"
+                        >
+                          ${truncateHash(tx.txid)} ↗
+                        </a>
+                      </div>
+                      ${tx.status.confirmed && html`
+                        <div class="flex items-center justify-between mt-2">
+                          <span class="text-gray-500 text-sm">Block</span>
+                          <span class="text-gray-400 text-sm">${tx.status.block_height}</span>
+                        </div>
+                      `}
+                      <div class="flex items-center justify-between mt-2">
+                        <span class="text-gray-500 text-sm">Fee</span>
+                        <span class="text-gray-400 text-sm">${tx.fee} sats</span>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              })}
+            </div>
+          `}
+        </div>
+      `;
+    }
+
+    function SettingsView({ wallet, onLogout }) {
+      const [showPrivateKey, setShowPrivateKey] = useState(false);
+      const [showWIF, setShowWIF] = useState(false);
+
+      const copyToClipboard = (text) => {
+        navigator.clipboard.writeText(text);
+      };
+
+      return html`
+        <div class="max-w-lg mx-auto space-y-6">
+          <div class="bg-gray-800 rounded-xl p-6">
+            <h3 class="text-xl font-semibold text-white mb-6">Wallet Settings</h3>
+
+            <div class="space-y-4">
+              <div class="bg-gray-900 rounded-lg p-4">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-gray-400 text-sm">Address</span>
+                  <button
+                    onClick=${() => copyToClipboard(wallet.address)}
+                    class="text-primary-400 hover:text-primary-300 text-sm"
+                  >
+                    Copy
+                  </button>
+                </div>
+                <code class="text-white text-sm break-all">${wallet.address}</code>
+              </div>
+
+              <div class="bg-gray-900 rounded-lg p-4">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-gray-400 text-sm">X-Only Public Key (Nostr npub)</span>
+                  <button
+                    onClick=${() => copyToClipboard(wallet.xOnlyPubKey || wallet.publicKey.slice(2))}
+                    class="text-primary-400 hover:text-primary-300 text-sm"
+                  >
+                    Copy
+                  </button>
+                </div>
+                <code class="text-white text-xs break-all">${wallet.xOnlyPubKey || wallet.publicKey.slice(2)}</code>
+              </div>
+
+              <div class="bg-gray-900 rounded-lg p-4">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-gray-400 text-sm">Compressed Public Key</span>
+                  <button
+                    onClick=${() => copyToClipboard(wallet.publicKey)}
+                    class="text-primary-400 hover:text-primary-300 text-sm"
+                  >
+                    Copy
+                  </button>
+                </div>
+                <code class="text-white text-xs break-all">${wallet.publicKey}</code>
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-red-900/30 border border-red-800 rounded-xl p-6">
+            <h3 class="text-lg font-semibold text-red-400 mb-4">Private Key Backup</h3>
+            <p class="text-gray-400 text-sm mb-4">
+              Keep your private key safe. Anyone with access to it can spend your funds. The hex format is compatible with Nostr.
+            </p>
+
+            <div class="space-y-4">
+              <div class="bg-gray-900 rounded-lg p-4">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-gray-400 text-sm">Hex Private Key (Nostr compatible)</span>
+                  <div class="flex gap-2">
+                    <button
+                      onClick=${() => setShowPrivateKey(!showPrivateKey)}
+                      class="text-primary-400 hover:text-primary-300 text-sm"
+                    >
+                      ${showPrivateKey ? 'Hide' : 'Show'}
+                    </button>
+                    ${showPrivateKey && html`
+                      <button
+                        onClick=${() => copyToClipboard(wallet.privateKey)}
+                        class="text-primary-400 hover:text-primary-300 text-sm"
+                      >
+                        Copy
+                      </button>
+                    `}
+                  </div>
+                </div>
+                ${showPrivateKey ? html`
+                  <code class="text-red-400 text-sm break-all">${wallet.privateKey}</code>
+                ` : html`
+                  <code class="text-gray-600 text-sm">••••••••••••••••••••••••••••••••</code>
+                `}
+              </div>
+
+              <div class="bg-gray-900 rounded-lg p-4">
+                <div class="flex items-center justify-between mb-2">
+                  <span class="text-gray-400 text-sm">WIF Private Key (Bitcoin)</span>
+                  <div class="flex gap-2">
+                    <button
+                      onClick=${() => setShowWIF(!showWIF)}
+                      class="text-primary-400 hover:text-primary-300 text-sm"
+                    >
+                      ${showWIF ? 'Hide' : 'Show'}
+                    </button>
+                    ${showWIF && html`
+                      <button
+                        onClick=${() => copyToClipboard(wallet.wif)}
+                        class="text-primary-400 hover:text-primary-300 text-sm"
+                      >
+                        Copy
+                      </button>
+                    `}
+                  </div>
+                </div>
+                ${showWIF ? html`
+                  <code class="text-red-400 text-xs break-all">${wallet.wif}</code>
+                ` : html`
+                  <code class="text-gray-600 text-sm">••••••••••••••••••••••••••••••••</code>
+                `}
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-gray-800 rounded-xl p-6">
+            <h3 class="text-lg font-semibold text-white mb-4">Danger Zone</h3>
+            <p class="text-gray-400 text-sm mb-4">
+              Disconnecting will remove the wallet from this device. Make sure you have backed up your private key.
+            </p>
+            <button
+              onClick=${onLogout}
+              class="w-full py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+            >
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+              </svg>
+              Disconnect Wallet
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    function Footer() {
+      return html`
+        <footer class="border-t border-gray-800 mt-12">
+          <div class="container mx-auto px-4 py-6 max-w-4xl">
+            <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
+              <p class="text-gray-500 text-sm">
+                blaketest · Bitcoin BLAKE2b testnet4 · For testing purposes only
+              </p>
+              <div class="flex gap-4">
+                <a
+                  href="${EXPLORER_BASE}"
+                  target="_blank"
+                  class="text-gray-500 hover:text-primary-400 text-sm"
+                >
+                  Block Explorer
+                </a>
+                <a
+                  href="https://github.com/bitcoin-blake/awesome-bitcoin-blake"
+                  target="_blank"
+                  class="text-gray-500 hover:text-primary-400 text-sm"
+                >
+                  Awesome list
+                </a>
+                <a
+                  href="https://github.com/bitcoin-blake/blaketest"
+                  target="_blank"
+                  class="text-gray-500 hover:text-primary-400 text-sm"
+                >
+                  Source
+                </a>
+              </div>
+            </div>
+          </div>
+        </footer>
+      `;
+    }
+
+    // Mount the app
+    render(html`<${App} />`, document.getElementById('app'));
+  </script>
+</body>
+</html>

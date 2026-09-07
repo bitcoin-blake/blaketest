@@ -189,11 +189,43 @@
       return missing;
     }
 
-    async function carryAcross(txid) {
-      const r = await fetch(`${SHA256D_API}/tx/${txid}/hex`);
-      if (!r.ok) throw new Error('Could not fetch the raw transaction from mempool.space');
-      const hex = (await r.text()).trim();
-      return broadcastTransaction(hex);
+    // A faucet spends its own change each time, so a payout may sit on top of
+    // a run of earlier payouts that nobody has carried yet. Walk the first
+    // input upwards until we hit a transaction the BLAKE2b side already has,
+    // then relay oldest first. Nodes cap an unconfirmed chain at 25, so a long
+    // run needs a block between batches; onProgress reports where we got to.
+    async function carryAcross(txid, onProgress) {
+      const chain = [];
+      const seen = new Set();
+      let cur = txid;
+      while (cur && !seen.has(cur) && chain.length < 400) {
+        seen.add(cur);
+        const here = await fetch(`${API_BASE}/tx/${cur}`);
+        if (here.ok) break;
+        chain.push(cur);
+        const t = await fetch(`${SHA256D_API}/tx/${cur}`);
+        if (!t.ok) throw new Error('Could not read the transaction from mempool.space');
+        cur = (await t.json()).vin[0]?.txid;
+      }
+      chain.reverse();
+      let sent = 0;
+      for (const id of chain) {
+        onProgress && onProgress(`Relaying ${sent + 1} of ${chain.length}…`);
+        const r = await fetch(`${SHA256D_API}/tx/${id}/hex`);
+        if (!r.ok) throw new Error('Could not fetch the raw transaction from mempool.space');
+        const hex = (await r.text()).trim();
+        try {
+          await broadcastTransaction(hex);
+          sent++;
+        } catch (e) {
+          if (/already/i.test(e.message)) { sent++; continue; }
+          if (/too-long-mempool-chain|too many unconfirmed/i.test(e.message)) {
+            throw new Error(`Relayed ${sent} of ${chain.length} earlier faucet transactions, then hit the node's 25-deep unconfirmed limit. Wait for the next BLAKE2b block and press Carry across again.`);
+          }
+          throw new Error(`Node rejected ${id.slice(0, 8)}…: ${e.message}`);
+        }
+      }
+      return { relayed: sent, total: chain.length };
     }
 
     // ===== WALLET STORAGE =====
@@ -636,15 +668,15 @@
       };
 
       const doCarry = async (txid) => {
-        setCarry(c => ({ ...c, state: 'carrying' }));
+        setCarry(c => ({ ...c, state: 'carrying', message: 'Checking earlier faucet transactions…' }));
         try {
-          await carryAcross(txid);
-          showNotification && showNotification('Carried across. It shows as pending until the next BLAKE2b block.', 'success');
+          const res = await carryAcross(txid, (m) => setCarry(c => ({ ...c, message: m })));
+          showNotification && showNotification(`Carried across (${res.total} transaction${res.total === 1 ? '' : 's'}). Pending until the next BLAKE2b block.`, 'success');
           setCarry(c => ({ state: 'done', items: c.items.filter(i => i.txid !== txid), message: '' }));
           onRefresh();
         } catch (e) {
-          const why = /missing|bad-txns-inputs|not found|Missing inputs/i.test(e.message)
-            ? 'The BLAKE2b chain does not have this transaction\'s inputs yet. The faucet\'s own earlier transaction has to be carried first, or its coins never existed on this side.'
+          const why = /missing-inputs|bad-txns-inputs/i.test(e.message)
+            ? 'The BLAKE2b chain does not have this transaction\'s inputs and they could not be traced to a transaction it does have. The coins may never have existed on this side.'
             : e.message;
           setCarry(c => ({ ...c, state: 'done', message: `Could not carry ${txid.slice(0, 8)}…: ${why}` }));
         }

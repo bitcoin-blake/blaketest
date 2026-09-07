@@ -13,6 +13,10 @@ Live: https://bitcoin-blake.github.io/blaketest/
 - Signs every input with `SIGHASH_ALL | SIGHASH_UNIFIED` (0x21), the replay-protection sighash shipped in Bitcoin Knots `v29.4.1.knots20260508` ([PR #357](https://github.com/bitcoinknots/bitcoin/pull/357)). Testnet4 activated it at block 150,308.
 - Talks to an Esplora-style API. Default is `https://mempool.guide/testnet4/api`.
 
+## Getting test coins
+
+Your address is the same on both testnet4 chains. Request coins from a SHA256d testnet4 faucet such as [faucet.activetk.jp](https://faucet.activetk.jp/), then use **Check SHA256d testnet4 for coins to carry across** on the wallet's home tab. Faucet payouts are signed with plain `SIGHASH_ALL`, so the same bytes are valid on the BLAKE2b chain; the wallet fetches the raw transaction from mempool.space and relays it to the BLAKE2b backend. It signs nothing. This only works while the faucet's coin lineage exists on both chains.
+
 ## Pointing it at your own node
 
 Append `?api=<base>` once and it is remembered in localStorage:

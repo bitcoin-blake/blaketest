@@ -165,6 +165,37 @@
       }
     }
 
+    // ===== CARRY ACROSS FROM SHA256d TESTNET4 =====
+    // Faucets pay on SHA256d testnet4 with legacy SIGHASH_ALL signatures. The
+    // same address exists on the BLAKE2b chain, and a legacy-signed transaction
+    // is valid on both, so relaying the faucet's raw bytes to a BLAKE2b node
+    // makes the coins appear here too. The wallet never signs anything for this;
+    // it only relays transactions that pay its own address.
+    const SHA256D_API = 'https://mempool.space/testnet4/api';
+
+    async function findCarryCandidates(address) {
+      const r = await fetch(`${SHA256D_API}/address/${address}/txs`);
+      if (!r.ok) throw new Error('Could not reach mempool.space testnet4');
+      const txs = await r.json();
+      const paying = txs.filter(tx => tx.vout.some(v => v.scriptpubkey_address === address)).slice(0, 10);
+      const missing = [];
+      for (const tx of paying) {
+        const here = await fetch(`${API_BASE}/tx/${tx.txid}`);
+        if (!here.ok) {
+          const amount = tx.vout.filter(v => v.scriptpubkey_address === address).reduce((a, v) => a + v.value, 0);
+          missing.push({ txid: tx.txid, amount, confirmed: !!tx.status?.confirmed });
+        }
+      }
+      return missing;
+    }
+
+    async function carryAcross(txid) {
+      const r = await fetch(`${SHA256D_API}/tx/${txid}/hex`);
+      if (!r.ok) throw new Error('Could not fetch the raw transaction from mempool.space');
+      const hex = (await r.text()).trim();
+      return broadcastTransaction(hex);
+    }
+
     // ===== WALLET STORAGE =====
 
     function saveWallet(wallet) {
@@ -351,6 +382,7 @@
                   onRefresh=${refreshData}
                   loading=${loading}
                   onShowInfo=${() => setShowSchemeInfo(true)}
+                  showNotification=${showNotification}
                 />
               `}
 
@@ -590,7 +622,34 @@
       `;
     }
 
-    function Dashboard({ wallet, balance, transactions, formatSats, formatDate, truncateHash, onRefresh, loading, onShowInfo }) {
+    function Dashboard({ wallet, balance, transactions, formatSats, formatDate, truncateHash, onRefresh, loading, onShowInfo, showNotification }) {
+      const [carry, setCarry] = useState({ state: 'idle', items: [], message: '' });
+
+      const checkCarry = async () => {
+        setCarry({ state: 'checking', items: [], message: '' });
+        try {
+          const items = await findCarryCandidates(wallet.address);
+          setCarry({ state: 'done', items, message: items.length ? '' : 'Nothing to carry across: every payment to this address on SHA256d testnet4 is already on the BLAKE2b chain.' });
+        } catch (e) {
+          setCarry({ state: 'done', items: [], message: `Check failed: ${e.message}` });
+        }
+      };
+
+      const doCarry = async (txid) => {
+        setCarry(c => ({ ...c, state: 'carrying' }));
+        try {
+          await carryAcross(txid);
+          showNotification && showNotification('Carried across. It shows as pending until the next BLAKE2b block.', 'success');
+          setCarry(c => ({ state: 'done', items: c.items.filter(i => i.txid !== txid), message: '' }));
+          onRefresh();
+        } catch (e) {
+          const why = /missing|bad-txns-inputs|not found|Missing inputs/i.test(e.message)
+            ? 'The BLAKE2b chain does not have this transaction\'s inputs yet. The faucet\'s own earlier transaction has to be carried first, or its coins never existed on this side.'
+            : e.message;
+          setCarry(c => ({ ...c, state: 'done', message: `Could not carry ${txid.slice(0, 8)}…: ${why}` }));
+        }
+      };
+
       return html`
         <div class="space-y-6">
           <!-- Balance Card -->
@@ -654,7 +713,7 @@
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
                 </svg>
                 <p class="text-gray-500">No transactions yet</p>
-                <p class="text-gray-600 text-sm mt-1">Mine some on a Knots testnet4 node, or ask in the Knots Discord</p>
+                <p class="text-gray-600 text-sm mt-1">Get coins from the faucet below</p>
               </div>
             ` : html`
               <div class="space-y-3">
@@ -704,24 +763,63 @@
             `}
           </div>
 
-          <!-- Faucet Info -->
+          <!-- Get test coins -->
           <div class="bg-gray-800 rounded-xl p-6">
             <h3 class="text-lg font-semibold text-white mb-3">Get Test Coins</h3>
             <p class="text-gray-400 text-sm mb-4">
-              There is no public faucet for the BLAKE2b testnet4 yet. Coins that existed on Bitcoin testnet4
-              before block 150,308 also exist here under the same keys, and a Knots 29.4.1 testnet4 node with a
-              DATUM gateway can mine new ones with a CPU miner.
+              Your address is the same on both testnet4 chains. Request coins from a SHA256d testnet4 faucet
+              and send them to the address above. The faucet's payout is signed the old way, so it is valid on
+              the BLAKE2b chain too, but nothing relays it here on its own. Check for it below and carry it
+              across with one click.
             </p>
-            <a
-              href="https://github.com/bitcoin-blake/awesome-bitcoin-blake#mining"
-              target="_blank"
-              class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition-colors"
-            >
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-              </svg>
-              Mining on the BLAKE2b chain
-            </a>
+            <div class="flex flex-col sm:flex-row gap-3 mb-4">
+              <a
+                href="https://faucet.activetk.jp/"
+                target="_blank"
+                class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition-colors"
+              >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+                Testnet4 faucet (activetk.jp)
+              </a>
+              <button
+                onClick=${checkCarry}
+                disabled=${carry.state === 'checking' || carry.state === 'carrying'}
+                class="inline-flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-white rounded-lg transition-colors"
+              >
+                ${carry.state === 'checking' ? html`<div class="loader"></div>` : html`
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
+                  </svg>
+                `}
+                Check SHA256d testnet4 for coins to carry across
+              </button>
+            </div>
+            ${carry.items.length > 0 && html`
+              <div class="space-y-2 mb-3">
+                ${carry.items.map(item => html`
+                  <div class="flex items-center justify-between p-3 bg-gray-900 rounded-lg">
+                    <div>
+                      <p class="text-white text-sm">${formatSats(item.amount)} BTC ${item.confirmed ? '' : html`<span class="text-yellow-400 text-xs">(unconfirmed on SHA256d)</span>`}</p>
+                      <a href="https://mempool.space/testnet4/tx/${item.txid}" target="_blank" class="text-gray-500 text-xs hover:text-primary-400">${truncateHash(item.txid, 8)}</a>
+                    </div>
+                    <button
+                      onClick=${() => doCarry(item.txid)}
+                      disabled=${carry.state === 'carrying'}
+                      class="px-3 py-2 bg-primary-600 hover:bg-primary-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
+                    >
+                      Carry across
+                    </button>
+                  </div>
+                `)}
+              </div>
+            `}
+            ${carry.message && html`<p class="text-gray-400 text-sm">${carry.message}</p>`}
+            <p class="text-gray-600 text-xs mt-2">
+              Carrying across relays the faucet's already-signed transaction to a BLAKE2b node. The wallet signs nothing.
+              Your own spends are signed with the unified sighash and can never be carried the other way.
+            </p>
           </div>
         </div>
       `;

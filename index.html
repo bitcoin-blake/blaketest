@@ -219,8 +219,12 @@
           sent++;
         } catch (e) {
           if (/already/i.test(e.message)) { sent++; continue; }
-          if (/too-long-mempool-chain|too many unconfirmed/i.test(e.message)) {
-            throw new Error(`Relayed ${sent} of ${chain.length} earlier faucet transactions, then hit the node's 25-deep unconfirmed limit. Wait for the next BLAKE2b block and press Carry across again.`);
+          // Esplora backends often return only {"code":-26} (policy rejection)
+          // without the reason. After a run of successful relays the only
+          // plausible -26 is the unconfirmed-chain limit.
+          const chainLimit = /too-long-mempool-chain|too many unconfirmed/i.test(e.message) || (sent > 0 && /-26/.test(e.message));
+          if (chainLimit) {
+            throw new Error(`Relayed ${sent} of ${chain.length} earlier faucet transactions, then hit the node's 25-deep unconfirmed limit. ${chain.length - sent} to go: wait for the next BLAKE2b block and press Carry across again.`);
           }
           throw new Error(`Node rejected ${id.slice(0, 8)}…: ${e.message}`);
         }
